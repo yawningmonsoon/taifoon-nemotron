@@ -1,3 +1,8 @@
+> ## ⚠️ This is the **code** repo — for docs, conventions, and the agent client, see  
+> ### → [yawningmonsoon/taifoon-intel-platform](https://github.com/yawningmonsoon/taifoon-intel-platform)
+>
+> If you are an autonomous agent (trader, polymarket helper, scanner, etc.), read [CONVENTIONS.md](https://github.com/yawningmonsoon/taifoon-intel-platform/blob/main/CONVENTIONS.md) before touching this stack.
+
 # taifoon-nemotron — Unified Intel API
 
 Three QLoRA adapters served on ONE CUDA device with ONE base model (NVIDIA Nemotron-3-Nano-4B-BF16):
