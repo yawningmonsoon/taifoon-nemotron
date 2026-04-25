@@ -7,14 +7,19 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root/taifoon-nemotron
+# system python has mamba_ssm + causal_conv1d; LD_PRELOAD bridges PyTorch C++ ABI
+Environment=LD_PRELOAD=/root/taifoon-training/libtorch_shim.so
 Environment=PORT=11500
+Environment=BASE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
 Environment=TAIFOON_ADAPTER=/root/taifoon-nemotron/adapters/final
 Environment=POLYMARKET_ADAPTER=/root/nemotron_training/models/nemotron-15m-nvidia-real/final
 Environment=ALGOTRADA_ADAPTER=/root/algotrada-training/adapters/final
-ExecStart=/root/nemotron_training/venv/bin/python /root/taifoon-nemotron/serve_intel.py
+ExecStart=/usr/bin/python3 /root/taifoon-nemotron/serve_intel.py
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
