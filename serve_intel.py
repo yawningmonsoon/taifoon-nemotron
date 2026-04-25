@@ -16,6 +16,11 @@ Routes:
 Where <name> ∈ {taifoon, polymarket, algotrada}. Algotrada slot returns
 503 until its adapter directory is populated.
 
+PERFORMANCE NOTES:
+- BF16 (not 8-bit) for faster matmul on RTX 4000 Ada (~5GB VRAM, fits comfortably)
+- Startup pre-warm with dummy generate eliminates 60s cold-CUDA on first user request
+- use_cache=True explicitly for KV cache reuse across tokens
+
 Owner: yawningmonsoon · Updated: 2026-04-25
 """
 import os, json, logging, threading, time
@@ -28,7 +33,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── adapter registry ───────────────────────────────────────────
-# Each entry: short slug → {path, base_model_override?, persona}
 ADAPTERS = {
     'taifoon':   {
         'path':    os.environ.get('TAIFOON_ADAPTER',   '/root/taifoon-nemotron/adapters/final'),
@@ -45,47 +49,57 @@ ADAPTERS = {
 }
 BASE_MODEL = os.environ.get('BASE_MODEL', 'nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16')
 PORT       = int(os.environ.get('PORT', '11500'))
+USE_8BIT   = os.environ.get('USE_8BIT', '0') == '1'  # default OFF — BF16 is faster on Ada
+PREWARM    = os.environ.get('PREWARM', '1') == '1'
 
 app = Flask(__name__)
-LOCK = threading.Lock()  # peft set_adapter is not thread-safe across concurrent reqs
+LOCK = threading.Lock()
 
-# Global model state
 _state = {
     'base_loaded':  False,
-    'adapters':     {},      # name → {loaded:bool, path:str, error?:str}
+    'adapters':     {},
     'tokenizer':    None,
     'model':        None,
     'started_at':   None,
+    'base_model':   BASE_MODEL,
+    'precision':    '8-bit' if USE_8BIT else 'bf16',
 }
 
+
 def _load():
-    """Heavy startup — load base model in 8-bit + each registered adapter."""
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel
 
     log.info('=' * 70)
-    log.info(f'Loading base {BASE_MODEL} on CUDA in 8-bit')
+    log.info(f'Loading base {BASE_MODEL}  precision={_state["precision"]}')
     log.info('=' * 70)
 
     tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    base = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        trust_remote_code=True,
-        load_in_8bit=True,
-        device_map='auto',
-        torch_dtype=torch.float16,
-    )
+    if USE_8BIT:
+        base = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            trust_remote_code=True,
+            load_in_8bit=True,
+            device_map='auto',
+            torch_dtype=torch.float16,
+        )
+    else:
+        base = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            device_map='auto',
+        )
 
-    # Load first adapter via PeftModel; subsequent via load_adapter
     model = None
-    for i, (slug, cfg) in enumerate(ADAPTERS.items()):
+    for slug, cfg in ADAPTERS.items():
         path = cfg['path']
         if not os.path.isdir(path) or not os.path.exists(os.path.join(path, 'adapter_config.json')):
-            log.warning(f'  [{slug}] NOT FOUND at {path} — skipping (slot reserved)')
+            log.warning(f'  [{slug}] NOT FOUND at {path} — slot reserved')
             _state['adapters'][slug] = {'loaded': False, 'path': path, 'error': 'adapter directory missing'}
             continue
         try:
@@ -101,7 +115,6 @@ def _load():
             _state['adapters'][slug] = {'loaded': False, 'path': path, 'error': str(e)}
 
     if model is None:
-        # No adapters loaded — fall back to base only
         log.warning('No adapters loaded; serving base model only')
         model = base
 
@@ -110,7 +123,24 @@ def _load():
     _state['tokenizer']   = tok
     _state['model']       = model
     _state['started_at']  = int(time.time())
-    log.info('Startup complete')
+
+    if PREWARM:
+        loaded = [n for n, info in _state['adapters'].items() if info.get('loaded')]
+        if loaded:
+            log.info(f'Pre-warming CUDA kernels with adapter={loaded[0]} (1 token)...')
+            t0 = time.time()
+            try:
+                with torch.inference_mode():
+                    if hasattr(model, 'set_adapter'):
+                        model.set_adapter(loaded[0])
+                    inputs = tok('Hi', return_tensors='pt').to(model.device)
+                    _ = model.generate(**inputs, max_new_tokens=1, do_sample=False,
+                                       pad_token_id=tok.eos_token_id, use_cache=True)
+                log.info(f'  pre-warm complete in {time.time()-t0:.1f}s')
+            except Exception as e:
+                log.warning(f'  pre-warm failed (non-fatal): {e}')
+
+    log.info(f'Startup complete — listening on 0.0.0.0:{PORT}')
 
 
 @app.route('/health')
@@ -118,6 +148,7 @@ def health():
     return jsonify({
         'status':       'ok' if _state['base_loaded'] else 'starting',
         'base_model':   BASE_MODEL,
+        'precision':    _state['precision'],
         'started_at':   _state['started_at'],
         'adapters':     _state['adapters'],
         'gpu':          _gpu_info(),
@@ -145,7 +176,7 @@ def adapter_generate(name):
     prompt   = body.get('prompt', '').strip()
     if not prompt:
         return jsonify({'error': 'prompt required'}), 400
-    max_new  = int(body.get('max_tokens', 256))
+    max_new  = int(body.get('max_tokens', 128))
     temp     = float(body.get('temperature', 0.6))
     system   = body.get('system', ADAPTERS[name]['persona'])
 
@@ -154,9 +185,9 @@ def adapter_generate(name):
     import torch
     with LOCK:
         try:
-            _state['model'].set_adapter(name)
+            if hasattr(_state['model'], 'set_adapter'):
+                _state['model'].set_adapter(name)
         except Exception:
-            # If only one adapter loaded, set_adapter may not be available; ignore
             pass
         tok = _state['tokenizer']
         inputs = tok(text, return_tensors='pt').to(_state['model'].device)
@@ -168,15 +199,18 @@ def adapter_generate(name):
                 temperature=temp,
                 do_sample=temp > 0.0,
                 pad_token_id=tok.eos_token_id,
+                use_cache=True,
             )
         dur = (time.time() - t0)
         gen = tok.decode(out[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
 
+    n_new = int(out.shape[1] - inputs['input_ids'].shape[1])
     return jsonify({
-        'model':     name,
-        'response':  gen.strip(),
-        'duration':  round(dur, 3),
-        'tokens':    int(out.shape[1] - inputs['input_ids'].shape[1]),
+        'model':      name,
+        'response':   gen.strip(),
+        'duration':   round(dur, 3),
+        'tokens':     n_new,
+        'tokens_per_second': round(n_new / max(dur, 1e-3), 2),
     })
 
 
@@ -196,5 +230,4 @@ def _gpu_info():
 
 if __name__ == '__main__':
     _load()
-    log.info(f'Listening on 0.0.0.0:{PORT}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
