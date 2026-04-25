@@ -1,0 +1,20 @@
+[Unit]
+Description=Taifoon Unified Intel API (multi-adapter QLoRA on Nemotron-3-Nano-4B)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/taifoon-nemotron
+Environment=PORT=11500
+Environment=TAIFOON_ADAPTER=/root/taifoon-nemotron/adapters/final
+Environment=POLYMARKET_ADAPTER=/root/nemotron_training/models/nemotron-15m-nvidia-real/final
+Environment=ALGOTRADA_ADAPTER=/root/algotrada-training/adapters/final
+ExecStart=/root/nemotron_training/venv/bin/python /root/taifoon-nemotron/serve_intel.py
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
