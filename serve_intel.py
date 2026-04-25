@@ -143,6 +143,22 @@ def _load():
     log.info(f'Startup complete — listening on 0.0.0.0:{PORT}')
 
 
+@app.route('/api/intel/_meta')
+def meta():
+    return jsonify({
+        'platform_repo':       'https://github.com/yawningmonsoon/taifoon-intel-platform',
+        'code_repo':           'https://github.com/yawningmonsoon/taifoon-nemotron',
+        'conventions_url':     'https://github.com/yawningmonsoon/taifoon-intel-platform/blob/main/CONVENTIONS.md',
+        'recommended_client':  'https://github.com/yawningmonsoon/taifoon-intel-platform/blob/main/clients/python/taifoon_intel.py',
+        'agent_integration':   'https://github.com/yawningmonsoon/taifoon-intel-platform/blob/main/docs/agent-integration.md',
+        'base_model':          BASE_MODEL,
+        'precision':           _state['precision'],
+        'models':              list(ADAPTERS.keys()),
+        'data_lake_root':      '/root/taifoon-intel-data',
+        'version':             '1.0.0',
+    })
+
+
 @app.route('/health')
 def health():
     return jsonify({
