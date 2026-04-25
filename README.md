@@ -1,24 +1,57 @@
-# taifoon-nemotron
+# taifoon-nemotron — Unified Intel API
 
-Taifoon Intel Agent \u2014 QLoRA fine-tuned on **Nemotron-3-Nano-4B** (NVIDIA Mamba-Transformer hybrid)
+Three QLoRA adapters served on ONE CUDA device with ONE base model (NVIDIA Nemotron-3-Nano-4B-BF16):
 
-## Model
-- Base: 
-- Fine-tune: QLoRA (r=32, \u03b1=64, NF4 4-bit, 3 epochs SFT)
-- Dataset: 1149 protocol-enriched v2 records (24 protocols, 25 agents, V5 proof system, razor economics)
+| Slug         | Adapter path                                             | Persona                                  |
+|--------------|----------------------------------------------------------|------------------------------------------|
+| `taifoon`    | `/root/taifoon-nemotron/adapters/final`                  | protocol intel, V5 finality, solver economics |
+| `polymarket` | `/root/nemotron_training/models/nemotron-15m-nvidia-real/final` | 15-min crypto predictions       |
+| `algotrada`  | `/root/algotrada-training/adapters/final` (TBD)          | cross-DEX arbitrage / execution intent   |
 
-## Quick Start
+## API
+- `GET  /health` — overall status, GPU usage, per-adapter load state
+- `GET  /api/intel/<name>/health` — one model
+- `POST /api/intel/<name>/generate` — body `{prompt, max_tokens?, temperature?, system?}`
 
+Public routes (via nginx on scanner.taifoon.dev):
+```
+GET  https://scanner.taifoon.dev/api/intel/taifoon/health
+POST https://scanner.taifoon.dev/api/intel/taifoon/generate
+```
 
+## Run
+```
+sudo cp systemd/taifoon-intel-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now taifoon-intel-api
+journalctl -u taifoon-intel-api -f
+```
 
-## Environment
-- GPU: RTX 4000 Ada (20GB VRAM)
-- PyTorch 2.6.0+cu124
-- mamba-ssm 2.3.1 (pre-built wheel + ABI shim for libtorch symbol compatibility)
+Stop the legacy single-adapter API on :11437 first to free GPU memory:
+```
+sudo systemctl stop nemotron-api      # if managed by systemd, or
+sudo pkill -f /opt/nemotron-api/nemotron_api.py
+```
 
-## ABI Fix
-PyTorch 2.6+cu124 exports  with old-ABI ,
-but the mamba-ssm pre-built wheel expects new-ABI .
- compiles  to bridge the gap.
-Use  for all mamba-ssm operations.
+## Continuous training
 
+Operational intel is appended to `data-lake/taifoon_intel_v3_ops_*.jsonl` by autonomous agents during the week. Run `./train-from-ops-lake.sh` (idempotent — skips if dataset hash unchanged) to combine v2 + v3 shards and re-run `sft_nemotron.py`. Schedule via cron (recommended weekly):
+
+```
+0 3 * * 0 cd /root/taifoon-nemotron && ./train-from-ops-lake.sh >> /var/log/taifoon-intel-train.log 2>&1
+```
+
+After a successful train, the systemd unit must be restarted to pick up the new adapter:
+```
+sudo systemctl restart taifoon-intel-api
+```
+
+## Adding a new adapter (e.g. algotrada-trader)
+
+1. Train the adapter using the same `sft_nemotron.py` flow against the algotrada training corpus
+2. Drop the resulting `adapter_config.json` + `adapter_model.safetensors` at the path declared in `systemd/taifoon-intel-api.service` (`ALGOTRADA_ADAPTER`)
+3. `systemctl restart taifoon-intel-api` — the slot becomes live; no code change required.
+
+## Architecture rationale
+
+PEFT supports multi-adapter loading (`model.load_adapter(name, path)` then `model.set_adapter(name)`). Memory cost: 1× base (~5GB in 8-bit) + N × LoRA (~80MB each). On RTX 4000 Ada (20GB VRAM) we have headroom for >10 adapters total. Switching adapters is sub-millisecond.
